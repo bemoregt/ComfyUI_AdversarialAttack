@@ -3,6 +3,7 @@ import torch.nn as nn
 import torchvision.models as models
 import torchvision.transforms.functional as TF
 import numpy as np
+import threading
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406])
 IMAGENET_STD  = torch.tensor([0.229, 0.224, 0.225])
@@ -28,54 +29,98 @@ def get_class_name(model_weights, idx: int) -> str:
         return str(idx)
 
 
+# ── Thread-based escape from inference_mode ───────────────────────────────────
+
+def _run_in_new_thread(fn, *args, **kwargs):
+    """
+    PyTorch grad mode (including inference_mode) is thread-local.
+    Running in a new thread starts with a clean grad state (no inference_mode).
+    """
+    result = [None]
+    error  = [None]
+
+    def target():
+        try:
+            result[0] = fn(*args, **kwargs)
+        except Exception as e:
+            error[0] = e
+
+    t = threading.Thread(target=target)
+    t.start()
+    t.join()
+    if error[0] is not None:
+        raise error[0]
+    return result[0]
+
+
 # ── FGSM ──────────────────────────────────────────────────────────────────────
 
-def fgsm(model, x_norm, true_label, epsilon, targeted=False):
-    """
-    x_norm : normalized image tensor [1, 3, H, W], requires_grad=True
-    Returns perturbed normalized tensor (clamped in pixel space).
-    """
-    with torch.enable_grad():
-        x_adv = x_norm.clone().detach().requires_grad_(True)
-        logits = model(x_adv)
-        loss = nn.CrossEntropyLoss()(logits, true_label)
-        if targeted:
-            loss = -loss
-        loss.backward()
-        grad_sign = x_adv.grad.sign()
+def _fgsm_inner(model, x_np, label_np, device_str, epsilon, targeted):
+    """Runs in a fresh thread — no inference_mode active."""
+    device = torch.device(device_str)
+    x_adv = torch.tensor(x_np, device=device, requires_grad=True)
+    label = torch.tensor(label_np, device=device)
 
-    # perturb in normalised space; clamp back to valid pixel range
-    x_adv_denorm = denormalize(x_adv) + epsilon * grad_sign * IMAGENET_STD.to(x_adv.device).view(1,3,1,1)
+    logits = model(x_adv)
+    loss   = nn.CrossEntropyLoss()(logits, label)
+    if targeted:
+        loss = -loss
+    loss.backward()
+    grad_sign = x_adv.grad.detach().sign().cpu().numpy()
+    return grad_sign
+
+
+def fgsm(model, x_norm, true_label, epsilon, targeted=False):
+    device = next(model.parameters()).device
+    x_np     = x_norm.detach().cpu().numpy().copy()
+    label_np = true_label.detach().cpu().numpy().copy()
+
+    grad_sign_np = _run_in_new_thread(
+        _fgsm_inner, model, x_np, label_np, str(device), epsilon, targeted
+    )
+    grad_sign = torch.from_numpy(grad_sign_np).to(device)
+
+    x_adv_denorm = denormalize(x_norm.detach()) + epsilon * grad_sign * IMAGENET_STD.to(device).view(1,3,1,1)
     x_adv_denorm = x_adv_denorm.clamp(0, 1)
     return normalize(x_adv_denorm).detach()
 
 
 # ── PGD ───────────────────────────────────────────────────────────────────────
 
-def pgd(model, x_norm, true_label, epsilon, alpha, iterations, targeted=False):
-    """
-    Projected Gradient Descent (Madry et al. 2017).
-    All perturbation arithmetic is done in pixel space; model receives normalised input.
-    """
-    x_orig = denormalize(x_norm).clamp(0, 1).detach()          # pixel space reference
-    x_adv  = x_orig.clone() + torch.empty_like(x_orig).uniform_(-epsilon, epsilon)
-    x_adv  = x_adv.clamp(0, 1)
+def _pgd_inner(model, x_orig_np, label_np, device_str, epsilon, alpha, iterations, targeted):
+    """Runs in a fresh thread — no inference_mode active."""
+    device  = torch.device(device_str)
+    x_orig  = torch.tensor(x_orig_np, device=device)
+    label   = torch.tensor(label_np, device=device)
+    x_adv   = x_orig.clone() + torch.empty_like(x_orig).uniform_(-epsilon, epsilon)
+    x_adv   = x_adv.clamp(0, 1)
 
     for _ in range(iterations):
-        with torch.enable_grad():
-            x_adv = x_adv.detach().requires_grad_(True)
-            logits = model(normalize(x_adv))
-            loss = nn.CrossEntropyLoss()(logits, true_label)
-            if targeted:
-                loss = -loss
-            loss.backward()
-            grad_sign = x_adv.grad.sign()
+        x_in   = x_adv.detach().requires_grad_(True)
+        logits = model(normalize(x_in))
+        loss   = nn.CrossEntropyLoss()(logits, label)
+        if targeted:
+            loss = -loss
+        loss.backward()
+        grad_sign = x_in.grad.detach().sign()
 
         x_adv = (x_adv + alpha * grad_sign).detach()
-        # project back onto epsilon-ball
         delta = (x_adv - x_orig).clamp(-epsilon, epsilon)
         x_adv = (x_orig + delta).clamp(0, 1)
 
+    return x_adv.cpu().numpy()
+
+
+def pgd(model, x_norm, true_label, epsilon, alpha, iterations, targeted=False):
+    device    = next(model.parameters()).device
+    x_orig_np = denormalize(x_norm).clamp(0, 1).detach().cpu().numpy().copy()
+    label_np  = true_label.detach().cpu().numpy().copy()
+
+    x_adv_np = _run_in_new_thread(
+        _pgd_inner, model, x_orig_np, label_np, str(device),
+        epsilon, alpha, iterations, targeted
+    )
+    x_adv = torch.from_numpy(x_adv_np).to(device)
     return normalize(x_adv).detach()
 
 
