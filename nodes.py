@@ -35,13 +35,14 @@ def fgsm(model, x_norm, true_label, epsilon, targeted=False):
     x_norm : normalized image tensor [1, 3, H, W], requires_grad=True
     Returns perturbed normalized tensor (clamped in pixel space).
     """
-    x_adv = x_norm.clone().detach().requires_grad_(True)
-    logits = model(x_adv)
-    loss = nn.CrossEntropyLoss()(logits, true_label)
-    if targeted:
-        loss = -loss
-    loss.backward()
-    grad_sign = x_adv.grad.sign()
+    with torch.enable_grad():
+        x_adv = x_norm.clone().detach().requires_grad_(True)
+        logits = model(x_adv)
+        loss = nn.CrossEntropyLoss()(logits, true_label)
+        if targeted:
+            loss = -loss
+        loss.backward()
+        grad_sign = x_adv.grad.sign()
 
     # perturb in normalised space; clamp back to valid pixel range
     x_adv_denorm = denormalize(x_adv) + epsilon * grad_sign * IMAGENET_STD.to(x_adv.device).view(1,3,1,1)
@@ -61,14 +62,15 @@ def pgd(model, x_norm, true_label, epsilon, alpha, iterations, targeted=False):
     x_adv  = x_adv.clamp(0, 1)
 
     for _ in range(iterations):
-        x_adv = x_adv.detach().requires_grad_(True)
-        logits = model(normalize(x_adv))
-        loss = nn.CrossEntropyLoss()(logits, true_label)
-        if targeted:
-            loss = -loss
-        loss.backward()
+        with torch.enable_grad():
+            x_adv = x_adv.detach().requires_grad_(True)
+            logits = model(normalize(x_adv))
+            loss = nn.CrossEntropyLoss()(logits, true_label)
+            if targeted:
+                loss = -loss
+            loss.backward()
+            grad_sign = x_adv.grad.sign()
 
-        grad_sign = x_adv.grad.sign()
         x_adv = (x_adv + alpha * grad_sign).detach()
         # project back onto epsilon-ball
         delta = (x_adv - x_orig).clamp(-epsilon, epsilon)
