@@ -2,6 +2,10 @@
 
 A ComfyUI custom node set that generates adversarial examples using a pretrained ResNet18 classifier. Given an input image, the nodes produce a visually similar output image that is misclassified as a **different** ImageNet class.
 
+![ComfyUI AdversarialAttack workflow — cat (tabby) misclassified as bald eagle](ScrShot%2018.png)
+
+> **Example:** A tabby cat image is fed into the node. After FGSM perturbation (ε = 0.03), ResNet18 classifies the output as **bald eagle** while the image remains visually identical to the original.
+
 ## Nodes
 
 ### 1. Load ResNet18
@@ -90,6 +94,8 @@ Stronger than FGSM. Increase `iterations` and tune `alpha` for harder attacks.
 ```
 
 Add **Classify Image** nodes on both the original and adversarial images to compare predictions side by side.
+
+![Workflow screenshot](ScrShot%2018.png)
 
 ---
 
