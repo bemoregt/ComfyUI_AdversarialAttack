@@ -146,10 +146,15 @@ class LoadResNet18:
     DESCRIPTION   = "ImageNet pretrained ResNet18 모델을 로드합니다."
 
     def load_model(self, pretrained: str):
+        # Must run outside inference_mode so model parameters are normal tensors
+        # (ComfyUI Desktop runs nodes inside torch.inference_mode())
+        result = _run_in_new_thread(self._load_model_inner, pretrained)
+        return result
+
+    def _load_model_inner(self, pretrained: str):
         weights = self.WEIGHTS if pretrained == "pretrained" else None
         model   = models.resnet18(weights=weights)
         model.eval()
-        # attach weights meta for class-name lookup later
         model._aa_weights = self.WEIGHTS
         return (model,)
 
